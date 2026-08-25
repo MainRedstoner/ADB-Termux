@@ -12,6 +12,13 @@ adb-termux-ssh/
 ├── termux-ssh.sh    # bash 版交互式 SSH（含 WSL 适配）
 ├── termux-ssh.ps1   # PowerShell 版（含 WSL 适配）
 ├── termux-ssh.bat   # cmd 版
+├── bin/             # 与根目录相同的可部署副本
+│   ├── adb-termux.sh
+│   ├── adb-termux.ps1
+│   ├── adb-termux.bat
+│   ├── termux-ssh.sh
+│   ├── termux-ssh.ps1
+│   └── termux-ssh.bat
 └── README.md
 ```
 
@@ -146,13 +153,13 @@ ADB shell 不分配 PTY（伪终端），后果：
 ┌─────────────────────────────────────────────────┐
 │                     Windows PC                  │
 │                                                 │
-│   ssh -p 8022 <动态用户名>@localhost              │
+│   ssh -p <临时端口> <动态用户名>@localhost │
 │        │                                        │
-│        │ adb forward tcp:8022 tcp:8022          │
+│        │ adb forward tcp:<临时端口> tcp:8022  │
 │        ▼                                        │
 │   ┌─────────┐    USB/WiFi    ┌────────────────┐ │
 │   │localhost│ ←────────────→ │ Android 设备    │ │
-│   │  :8022  │                │  sshd -p 8022  │ │
+│   │:<自动端口>│                │  sshd -p 8022  │ │
 │   └─────────┘                │  (Termux 内)   │ │
 │                              └────────────────┘ │
 └─────────────────────────────────────────────────┘
@@ -174,10 +181,10 @@ bash 版自动处理：
 ```
 WSL2 虚拟机                Windows 宿主
     │                         │
-    │  ssh 到宿主 IP:18022     │
+    │  ssh 到宿主 IP:<代理端口>  │
     │ ──────────────────────→ │ netsh portproxy
-    │                         │ 0.0.0.0:18022
-    │                         │   → 127.0.0.1:8022
+    │                         │ 0.0.0.0:<代理端口>
+    │                         │   → 127.0.0.1:<临时本地端口>
     │                         │       → adb forward
     │                         │           → 手机 sshd
 ```
@@ -253,6 +260,37 @@ adb-termux.sh "pkill sshd; sshd -p 8022"
 
 所有额外参数透明传递给 `ssh`。
 
+### 故障排查
+
+如果 `termux-ssh` 无法启动，先确认 ADB 状态：
+
+```bash
+adb kill-server
+adb start-server
+adb devices
+```
+
+要求看到：
+
+```text
+<设备序列号>       device
+```
+
+如果是：
+
+```text
+unauthorized
+offline
+```
+
+说明手机端 USB 调试授权或 ADB 传输有问题，先在手机上重新授权/重新插拔，不要直接改脚本。
+
+脚本现在的行为：
+
+- 启动前用 `adb get-state` 快速检查，设备未连接、未授权、offline 时立即报错；
+- bash 版对后续 `adb shell` 操作加了 10 秒超时，设备 shell 无响应时不会无限卡住；
+- SSH 退出后自动删除本次 ADB 临时转发。
+
 ---
 
 ## 开发踩坑记录
@@ -273,13 +311,13 @@ Git-Bash 的 MSYS 层会自动把 POSIX 路径转成 Windows 路径，例如 `/d
 
 PowerShell 5 和 cmd 默认按系统 ANSI 编码（中文 Windows 是 GBK）读取脚本文件。UTF-8 无 BOM 的中文注释和字符串会变成乱码，其中某些字节恰好是 `"`（0x22），导致字符串提前终止、语法错误甚至死循环。
 
-**修复：** `.ps1` 和 `.bat` 中使用纯英文注释和消息。bash 版保留中文（Git-Bash 走 UTF-8 无此问题）。
+**修复：** 三个脚本统一使用纯英文注释和消息，避免编码问题。
 
 ### 4. PS5 下数组 splatting 传参异常（ps1）
 
 `& ssh @sshArgs` 这种 PowerShell 数组展开语法在 PS5 中对 native 命令行为不可靠，可能打乱参数顺序，导致 `u0_a185@localhost` 被当成远程命令执行。
 
-**修复：** 直接用 `ssh -o ... -p 8022` 调用，不使用 `&` + 数组 splatting。
+**修复：** 直接用 `ssh -o ... -p <自动端口>` 调用，不使用 `&` + 数组 splatting。
 
 ### 5. cmd `echo` 的 CRLF 换行符（bat）
 
@@ -299,7 +337,21 @@ bash 版最初写死了 `/mnt/c/Users/MainRedstoner/...`，换一台电脑或 WS
 
 **修复：** 优先检查 `adb.exe` 是否在 PATH 中；不在则用 `cmd.exe /c 'echo %LOCALAPPDATA%'` 获取路径，`wslpath` 转成 WSL 格式。不依赖用户名、系统盘符。
 
+### 8. 本地 SSH 转发端口固定导致冲突
+
+最初所有版本都使用 `adb forward tcp:8022 tcp:8022`，如果 Windows 上已有程序占用 8022（例如本地 HTTP 服务），ADB 转发会绑定失败，SSH 会连到错误服务。
+
+**修复：** 三个 `termux-ssh` 脚本现在使用 `adb forward tcp:0 tcp:8022` 让 ADB 自动分配一个临时本地端口，SSH 结束后会删除该临时转发。WSL 的 portproxy 也会自动复用/更新到对应的临时本地转发端口，避免再次撞上 8022。
+
+### 9. ADB 设备“假在线”导致脚本卡死
+
+有时 `adb devices` 显示 `device`，但实际 `adb shell` 已经无响应，脚本会一直卡住。
+
+**修复：** 脚本先通过 `adb get-state` 快速判断设备状态；bash 版后续所有 `adb shell run-as ...` 操作都有 10 秒超时，超时后直接报错退出，避免永久挂起。
+
 ---
+
+
 
 ## 快速对照
 
