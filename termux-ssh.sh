@@ -1,7 +1,7 @@
 #!/bin/bash
 # termux-ssh.sh - SSH into Termux with a full PTY via ADB forward.
 # Uses a temporary ADB-forwarded local port to avoid conflicts with other services.
-# Compatible with Git-Bash (Windows) and WSL.
+# Compatible with Git-Bash (Windows), WSL and native Linux.
 
 export MSYS_NO_PATHCONV=1
 
@@ -28,6 +28,7 @@ if grep -qi microsoft /proc/version 2>/dev/null; then
     SSH_HOST="$GATEWAY"
     IS_WSL=1
 else
+    # Native Linux / Git-Bash / Cygwin: use native adb and connect via localhost.
     ADB="adb"
     adb() { command adb "$@"; }
     SSH_HOST="localhost"
@@ -43,7 +44,7 @@ fi
 
 # Wrap adb shell with a timeout so an unresponsive device cannot hang the script forever.
 adb_shell() {
-    timeout 10 "$ADB" shell "$@" || {
+    timeout 10 "$ADB" shell -T "$@" || {
         rc=$?
         if [ "$rc" -eq 124 ]; then
             echo "ERROR: ADB shell timed out; the device may be unresponsive. Reconnect/authorize the phone." >&2
@@ -130,7 +131,21 @@ if ! adb_shell run-as com.termux /data/data/com.termux/files/usr/bin/pgrep -f ss
     echo "Starting sshd on the device..." >&2
     SSHD_CMD='export HOME=/data/data/com.termux/files/home; export PATH=/data/data/com.termux/files/usr/bin:/data/data/com.termux/files/usr/bin/applets:$PATH; export LD_LIBRARY_PATH=/data/data/com.termux/files/usr/lib; export PREFIX=/data/data/com.termux/files/usr; exec /data/data/com.termux/files/usr/bin/sshd -p '"$REMOTE_PORT"
     adb_shell "run-as com.termux /data/data/com.termux/files/usr/bin/bash -c '$SSHD_CMD'" >/dev/null
+fi
+
+# Wait until sshd actually answers on the forwarded port. A blind short sleep
+# races sshd startup, and phone power management can drop loopback
+# connections for a while.
+SSH_READY=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if [ "$(timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$SSH_PORT && head -c 4 <&3" 2>/dev/null)" = "SSH-" ]; then
+        SSH_READY=1
+        break
+    fi
     sleep 1
+done
+if [ "$SSH_READY" != "1" ]; then
+    echo "WARNING: sshd not answering on port $SSH_PORT yet; trying anyway..." >&2
 fi
 
 TERMUX_USER=$(adb_shell run-as com.termux whoami | tr -d '\r\n')
@@ -140,4 +155,17 @@ if [ -z "$TERMUX_USER" ]; then
 fi
 
 echo "Connecting: ${TERMUX_USER}@${SSH_HOST}:${SSH_PORT} (temporary adb forward tcp:${LOCAL_PORT} -> tcp:${REMOTE_PORT})" >&2
-ssh -o StrictHostKeyChecking=accept-new -i "$HOME/.ssh/id_ed25519_termux" -p "$SSH_PORT" "${TERMUX_USER}@$SSH_HOST" "$@"
+# Preferred key can be overridden with TERMUX_SSH_KEY; fall back to the common
+# default key when the dedicated Termux key is not present, letting ssh also use
+# an agent or password if no key file exists.
+SSH_KEY="${TERMUX_SSH_KEY:-$HOME/.ssh/id_ed25519_termux}"
+if [ ! -f "$SSH_KEY" ] && [ -f "$HOME/.ssh/id_ed25519" ]; then
+    SSH_KEY="$HOME/.ssh/id_ed25519"
+fi
+
+SSH_KEY_ARGS=()
+if [ -f "$SSH_KEY" ]; then
+    SSH_KEY_ARGS=(-i "$SSH_KEY")
+fi
+
+ssh -o StrictHostKeyChecking=accept-new "${SSH_KEY_ARGS[@]}" -p "$SSH_PORT" "${TERMUX_USER}@$SSH_HOST" "$@"

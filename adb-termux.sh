@@ -2,32 +2,40 @@
 # adb-termux - 通过 ADB 在手机 Termux 中执行命令
 # 用法: adb-termux "你的命令"
 # 示例: adb-termux "pip list | grep numpy"
-# 兼容 Git-Bash (Windows) 和 WSL
+# 兼容 Git-Bash (Windows)、WSL 和原生 Linux
 #
 # 交互模式请用 termux-ssh（SSH 提供完整 PTY，支持 tab补全/nano/job control）
 
-# WSL: 需要特殊处理（adb.exe 路径、wslpath 替代 cygpath）
+# Platform detection: WSL / native Linux / Git-Bash (MSYS)
+# WSL needs adb.exe and wslpath; native Linux uses POSIX paths directly.
 if grep -qi microsoft /proc/version 2>/dev/null; then
-    # 自动定位 Windows 版 adb.exe
+    # Locate Windows adb.exe
     if command -v adb.exe &>/dev/null; then
         ADB="adb.exe"
     else
-        # 用 %LOCALAPPDATA% 获取路径（不依赖用户名/系统盘）
         WIN_APPDATA=$(cmd.exe /c 'echo %LOCALAPPDATA%' 2>/dev/null | tr -d '\r\n ')
         ADB="$(wslpath "${WIN_APPDATA}\\Android\\platform-tools\\adb.exe")"
         if [ ! -f "$ADB" ]; then
-            echo "错误: 找不到 adb.exe，请安装 Android Platform Tools 或将其加入 PATH"
+            echo "ERROR: adb.exe not found. Install Android Platform Tools or add it to PATH." >&2
             exit 1
         fi
     fi
-    # WSL 路径转换用 wslpath（不是 cygpath）
+    # WSL path conversion via wslpath
     to_win_path() { wslpath -w "$1"; }
+elif [ "$(uname -s)" = "Linux" ]; then
+    # Native Linux: adb accepts POSIX paths directly; no cygpath/wslpath needed.
+    if ! command -v adb >/dev/null 2>&1; then
+        echo "ERROR: adb not found. Install Android Platform Tools or add it to PATH." >&2
+        exit 1
+    fi
+    adb() { command adb "$@"; }
+    ADB="adb"
+    to_win_path() { printf '%s\n' "$1"; }
 else
-    # Git-Bash (MSYS): 禁止 MSYS 自动转换 POSIX 路径
+    # Git-Bash / MSYS / Cygwin: disable MSYS path conversion and use cygpath.
     export MSYS_NO_PATHCONV=1
     adb() { command adb "$@"; }
     ADB="adb"
-    # MSYS 路径转换用 cygpath
     to_win_path() { cygpath -w "$1"; }
 fi
 
@@ -36,7 +44,7 @@ if [ $# -eq 0 ] || [ "$1" = "-i" ] || [ "$1" = "shell" ]; then
     exit 1
 fi
 
-CMD="$1"
+CMD="$*"
 TMP_NAME="_adb_termux_$$.sh"
 LOCAL_TMP="$HOME/$TMP_NAME"
 

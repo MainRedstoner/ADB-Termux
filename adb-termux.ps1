@@ -7,8 +7,6 @@
     pushes it to the device, and runs it via adb shell run-as.
     Auto-detects WSL and adapts paths / adb location accordingly.
     Color output is enabled (CLICOLOR_FORCE / FORCE_COLOR).
-.PARAMETER CommandArgs
-    The command to execute (remaining args are auto-joined, no quotes needed).
 .EXAMPLE
     .\adb-termux.ps1 pip list
     .\adb-termux.ps1 python -c 'print(1+1)'
@@ -16,10 +14,9 @@
     For interactive shell, use termux-ssh.ps1 instead.
 #>
 
-param(
-    [Parameter(ValueFromRemainingArguments = $true)]
-    [string[]]$CommandArgs
-)
+# Use $args instead of a param() block so tokens like -c / --version are
+# passed through verbatim instead of failing positional binding.
+$CommandArgs = $args
 
 if (-not $CommandArgs) {
     Write-Host "Usage: adb-termux.ps1 <command> [args...]" -ForegroundColor Yellow
@@ -28,8 +25,18 @@ if (-not $CommandArgs) {
     exit 1
 }
 
-# ── WSL detection and adaptation ─────────────────────────────────
-$isWsl = Test-Path /proc/version -ErrorAction SilentlyContinue
+# ── Platform detection: WSL / native Linux / Windows ────────────
+$isWsl = $false
+if (Test-Path /proc/version -ErrorAction SilentlyContinue) {
+    $procVersion = Get-Content /proc/version -Raw -ErrorAction SilentlyContinue
+    $isWsl = $procVersion -match 'Microsoft'
+}
+
+$nativeLinux = $false
+if (-not $isWsl -and (Get-Command uname -ErrorAction SilentlyContinue)) {
+    $unameOut = (uname -s 2>$null | Out-String).Trim()
+    $nativeLinux = $unameOut -eq 'Linux'
+}
 
 if ($isWsl) {
     # Running under Linux PowerShell in WSL: need Windows adb.exe
@@ -43,6 +50,12 @@ if ($isWsl) {
             exit 1
         }
     }
+} elseif ($nativeLinux) {
+    if (-not (Get-Command adb -ErrorAction SilentlyContinue)) {
+        Write-Host "ERROR: adb not found. Install Android Platform Tools or add to PATH." -ForegroundColor Red
+        exit 1
+    }
+    $adb = 'adb'
 } else {
     $adb = 'adb'
 }
@@ -55,7 +68,11 @@ if ($isWsl) {
     # WSL: write to WSL temp, convert to Windows path for adb push
     $LocalTmp = "/tmp/$TmpName"
     $LocalTmpWin = wslpath -w $LocalTmp
+} elseif ($nativeLinux) {
+    # Native Linux: use a POSIX temp path directly
+    $LocalTmp = Join-Path ([System.IO.Path]::GetTempPath()) $TmpName
 } else {
+    # Windows: use the user profile directory
     $LocalTmp = Join-Path $env:USERPROFILE $TmpName
 }
 

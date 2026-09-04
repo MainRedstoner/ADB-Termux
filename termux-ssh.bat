@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal enabledelayedexpansion
 :: termux-ssh.bat - SSH into Termux (cmd version)
 :: Uses a temporary local port, starts sshd, then connects.
 
@@ -39,9 +39,20 @@ adb shell run-as com.termux /data/data/com.termux/files/usr/bin/pgrep -f sshd >n
 if errorlevel 1 (
     echo Starting sshd...
     set "SSHD_SCRIPT=export HOME=/data/data/com.termux/files/home; export PATH=/data/data/com.termux/files/usr/bin:/data/data/com.termux/files/usr/bin/applets:$PATH; export LD_LIBRARY_PATH=/data/data/com.termux/files/usr/lib; export PREFIX=/data/data/com.termux/files/usr; exec /data/data/com.termux/files/usr/bin/sshd -p %REMOTE_PORT%"
-    adb shell "run-as com.termux /data/data/com.termux/files/usr/bin/bash -c '%SSHD_SCRIPT%'" >nul 2>&1
-    ping -n 2 127.0.0.1 >nul
+    adb shell "run-as com.termux /data/data/com.termux/files/usr/bin/bash -c '!SSHD_SCRIPT!'" >nul 2>&1
 )
+
+:: Wait until sshd actually answers on the forwarded port. A blind short
+:: delay races sshd startup, and phone power management can drop loopback
+:: connections for a while.
+set "READY=0"
+for /l %%N in (1,1,10) do (
+    if "!READY!"=="0" (
+        powershell -NoProfile -Command "$c=New-Object Net.Sockets.TcpClient; try{$a=$c.BeginConnect('127.0.0.1',%LOCAL_PORT%,$null,$null);if($a.AsyncWaitHandle.WaitOne(2000) -and $c.Connected){$s=$c.GetStream();$s.ReadTimeout=2000;$b=New-Object byte[] 4;if($s.Read($b,0,4) -ge 4 -and $b[0]-eq 83 -and $b[1]-eq 83 -and $b[2]-eq 72 -and $b[3]-eq 45){exit 0}};exit 1}catch{exit 1}finally{$c.Close()}" >nul 2>&1 && set "READY=1"
+        if "!READY!"=="0" ping -n 2 127.0.0.1 >nul
+    )
+)
+if not "%READY%"=="1" echo WARNING: sshd not answering on port %LOCAL_PORT% yet; trying anyway...
 
 :: Dynamically resolve Termux username
 for /f "delims=" %%i in ('adb shell "run-as com.termux whoami" 2^>nul') do set "TERMUX_USER=%%i"

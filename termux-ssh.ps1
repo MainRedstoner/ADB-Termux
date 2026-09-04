@@ -4,24 +4,33 @@
     SSH into Termux with full PTY support (tab completion, nano, job control).
 .DESCRIPTION
     Uses a temporary adb-forwarded local port, starts sshd if needed,
-    then connects. Auto-detects WSL and adapts: portproxy relay, .exe suffix, host IP.
-.PARAMETER SshArgs
-    Arguments forwarded to ssh. No args = interactive shell; with args = run and exit.
+    then connects. Auto-detects WSL / native Linux / Windows and adapts
+    adb path, portproxy relay, host and SSH key behavior.
 .EXAMPLE
     .\termux-ssh.ps1
     .\termux-ssh.ps1 python --version
     .\termux-ssh.ps1 "pip list | grep numpy"
 #>
 
-param(
-    [Parameter(ValueFromRemainingArguments = $true)]
-    [string[]]$SshArgs
-)
+# Use $args instead of a param() block so tokens like --version are
+# forwarded to ssh verbatim instead of failing positional binding.
+$SshArgs = $args
 
 $remotePort = 8022
 $proxyPortCandidates = @(18022,18023,18024,18025,28022,28023,28024,38022,38023,38024)
 
-$isWsl = Test-Path /proc/version -ErrorAction SilentlyContinue
+# Platform detection: WSL / native Linux / Windows
+$isWsl = $false
+if (Test-Path /proc/version -ErrorAction SilentlyContinue) {
+    $procVersion = Get-Content /proc/version -Raw -ErrorAction SilentlyContinue
+    $isWsl = $procVersion -match 'Microsoft'
+}
+
+$nativeLinux = $false
+if (-not $isWsl -and (Get-Command uname -ErrorAction SilentlyContinue)) {
+    $unameOut = (uname -s 2>$null | Out-String).Trim()
+    $nativeLinux = $unameOut -eq 'Linux'
+}
 
 if ($isWsl) {
     if (Get-Command adb.exe -ErrorAction SilentlyContinue) {
@@ -39,6 +48,13 @@ if ($isWsl) {
         $gateway = (Get-Content /etc/resolv.conf | Select-String 'nameserver').ToString().Split()[1]
     }
     $sshHost = $gateway
+} elseif ($nativeLinux) {
+    if (-not (Get-Command adb -ErrorAction SilentlyContinue)) {
+        Write-Host "ERROR: adb not found. Install Android Platform Tools or add to PATH." -ForegroundColor Red
+        exit 1
+    }
+    $adb = 'adb'
+    $sshHost = 'localhost'
 } else {
     $adb = 'adb'
     $sshHost = 'localhost'
@@ -49,6 +65,22 @@ $adbState = (& $adb get-state 2>$null | Out-String).Trim()
 if ($adbState -ne 'device') {
     Write-Host "ERROR: ADB is not connected or the device is unauthorized (state: $adbState)." -ForegroundColor Red
     exit 1
+}
+
+# Wrap adb shell with a timeout on native Linux so an unresponsive device cannot hang forever.
+function Invoke-AdbShell {
+    param(
+        [string]$AdbShellCommand
+    )
+    if ($nativeLinux) {
+        & timeout 10 $adb shell -T $AdbShellCommand
+        if ($LASTEXITCODE -eq 124) {
+            Write-Host "ERROR: ADB shell timed out; the device may be unresponsive." -ForegroundColor Red
+            exit 1
+        }
+    } else {
+        & $adb shell -T $AdbShellCommand
+    }
 }
 
 function Get-ForwardPorts {
@@ -138,25 +170,61 @@ if ($isWsl) {
     $sshPort = $localPort
 }
 
-$sshdCheck = & $adb shell "run-as com.termux /data/data/com.termux/files/usr/bin/pgrep -f sshd" 2>$null
+# Returns $true when an SSH server banner is readable on the port.
+function Test-SshdBanner {
+    param(
+        [int]$Port
+    )
+    $client = [Net.Sockets.TcpClient]::new()
+    try {
+        $async = $client.BeginConnect('127.0.0.1', $Port, $null, $null)
+        if (-not $async.AsyncWaitHandle.WaitOne(2000) -or -not $client.Connected) { return $false }
+        $stream = $client.GetStream()
+        $stream.ReadTimeout = 2000
+        $banner = [byte[]]::new(4)
+        if ($stream.Read($banner, 0, 4) -lt 4) { return $false }
+        return ($banner[0] -eq 83 -and $banner[1] -eq 83 -and $banner[2] -eq 72 -and $banner[3] -eq 45)
+    } catch {
+        return $false
+    } finally {
+        $client.Close()
+    }
+}
+
+$sshdCheck = Invoke-AdbShell "run-as com.termux /data/data/com.termux/files/usr/bin/pgrep -f sshd" 2>$null
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Starting sshd..."
     $sshdScript = 'export HOME=/data/data/com.termux/files/home; export PATH=/data/data/com.termux/files/usr/bin:/data/data/com.termux/files/usr/bin/applets:$PATH; export LD_LIBRARY_PATH=/data/data/com.termux/files/usr/lib; export PREFIX=/data/data/com.termux/files/usr; exec /data/data/com.termux/files/usr/bin/sshd -p ' + $remotePort
     $sshdCommand = "run-as com.termux /data/data/com.termux/files/usr/bin/bash -c '$sshdScript'"
-    $null = & $adb shell $sshdCommand 2>$null
-    Start-Sleep -Seconds 1
+    $null = Invoke-AdbShell $sshdCommand 2>$null
 }
 
-$termuxUser = (& $adb shell "run-as com.termux whoami" 2>$null).Trim()
+# Wait until sshd actually answers on the forwarded port. A blind short sleep
+# races sshd startup, and phone power management can drop loopback
+# connections for a while.
+$sshdReady = $false
+foreach ($unused in 1..10) {
+    if (Test-SshdBanner -Port $sshPort) {
+        $sshdReady = $true
+        break
+    }
+    Start-Sleep -Milliseconds 500
+}
+if (-not $sshdReady) {
+    Write-Host "WARNING: sshd not answering on port $sshPort yet; trying anyway..." -ForegroundColor Yellow
+}
+
+$termuxUser = (Invoke-AdbShell "run-as com.termux whoami" 2>$null).Trim()
 if (-not $termuxUser) {
     Write-Host "ERROR: Failed to get Termux username. Is ADB connected?" -ForegroundColor Red
     exit 1
 }
 
-$keyPath = if ($isWsl) {
-    "$env:HOME/.ssh/id_ed25519_termux"
-} else {
-    "$env:USERPROFILE\.ssh\id_ed25519_termux"
+$keyPath = Join-Path $HOME '.ssh/id_ed25519_termux'
+if ($env:TERMUX_SSH_KEY) {
+    $keyPath = $env:TERMUX_SSH_KEY
+} elseif (-not (Test-Path $keyPath) -and (Test-Path (Join-Path $HOME '.ssh/id_ed25519'))) {
+    $keyPath = Join-Path $HOME '.ssh/id_ed25519'
 }
 
 try {

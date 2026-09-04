@@ -6,11 +6,11 @@
 
 ```
 adb-termux-ssh/
-├── adb-termux.sh    # bash 版一次性命令执行（含 WSL 适配）
-├── adb-termux.ps1   # PowerShell 版（含 WSL 适配）
+├── adb-termux.sh    # bash 版一次性命令执行（含 WSL / Linux 适配）
+├── adb-termux.ps1   # PowerShell 版（含 WSL / Linux 适配）
 ├── adb-termux.bat   # cmd 版
-├── termux-ssh.sh    # bash 版交互式 SSH（含 WSL 适配）
-├── termux-ssh.ps1   # PowerShell 版（含 WSL 适配）
+├── termux-ssh.sh    # bash 版交互式 SSH（含 WSL / Linux 适配）
+├── termux-ssh.ps1   # PowerShell 版（含 WSL / Linux 适配）
 ├── termux-ssh.bat   # cmd 版
 ├── bin/             # 与根目录相同的可部署副本
 │   ├── adb-termux.sh
@@ -106,7 +106,7 @@ pip list
 ### 用法
 
 ```bash
-# bash (Git-Bash / WSL)
+# bash (Git-Bash / WSL / 原生 Linux)
 ./adb-termux.sh "pip list"
 ./adb-termux.sh "python -c 'print(1+1)'"
 
@@ -122,8 +122,8 @@ adb-termux.bat "pip list"
 
 |       | bash                                   | PowerShell                      | cmd                 |
 | ----- | -------------------------------------- | ------------------------------- | ------------------- |
-| 平台    | Git-Bash / WSL 自适应                     | Windows (PS5/PS7) / WSL 自适应     | Windows (cmd)       |
-| 路径转换  | MSYS: `cygpath -w` / WSL: `wslpath -w` | Windows: 直接 / WSL: `wslpath -w` | 直接使用                |
+| 平台    | Git-Bash / WSL / 原生 Linux 自适应         | Windows (PS5/PS7) / WSL / 原生 Linux 自适应 | Windows (cmd)       |
+| 路径转换  | MSYS: `cygpath -w` / WSL: `wslpath -w` / Linux: 直接 | Windows: 直接 / WSL: `wslpath -w` / Linux: 直接 | 直接使用                |
 | 换行符   | `\n`（天然 Unix）                          | `\n`（Set-Content）               | 需 `powershell` 转 LF |
 | 清理可靠性 | `trap ... EXIT`*                       | `try/finally`*                  | 顺序执行†               |
 
@@ -201,9 +201,13 @@ WSL2 虚拟机                Windows 宿主
 
 不依赖 Windows 用户名、WSL 用户名、系统盘符——`%LOCALAPPDATA%` 永远是正确答案。
 
+### 原生 Linux 适配（bash / pwsh 版）
+
+原生 Linux 上直接使用本机 `adb`，不需要 `adb.exe`、`cygpath` / `wslpath` 或 Windows portproxy；SSH 通过 `adb forward` 分配的本机端口连接 `localhost`。bash 和 pwsh 版都会自动检测 Linux，在 Linux 上直接使用 POSIX 路径推送临时脚本，并自动调整 SSH 密钥路径；pwsh 的 `adb shell` 调用也会带超时保护，避免设备无响应时一直卡住。
+
 ### SSH 认证
 
-优先使用密钥 `~/.ssh/id_ed25519_termux`，不存在则回退到密码。
+bash 版优先使用 `$TERMUX_SSH_KEY`，pwsh 版使用 `$env:TERMUX_SSH_KEY`；默认密钥是 `~/.ssh/id_ed25519_termux`。若该专用密钥不存在，会回退到 `~/.ssh/id_ed25519`，并继续支持 ssh-agent 或密码认证。
 
 首次配置密钥登录：
 
@@ -348,6 +352,10 @@ bash 版最初写死了 `/mnt/c/Users/MainRedstoner/...`，换一台电脑或 WS
 有时 `adb devices` 显示 `device`，但实际 `adb shell` 已经无响应，脚本会一直卡住。
 
 **修复：** 脚本先通过 `adb get-state` 快速判断设备状态；bash 版后续所有 `adb shell run-as ...` 操作都有 10 秒超时，超时后直接报错退出，避免永久挂起。
+
+### 10. 原生 Linux 路径转换
+
+原生 Linux 的 `adb` 本身接受 POSIX 路径，不需要 `cygpath` / `wslpath`。bash 和 pwsh 脚本现在都会检测 Linux，在 Linux 上直接使用原生路径，避免误走 WSL/Windows 路径转换分支。
 
 ---
 
